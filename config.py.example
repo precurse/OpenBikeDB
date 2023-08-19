@@ -1,0 +1,5 @@
+BTLE_NAME = "IC Bike"
+WIFI_SSID = "FooBarWifi"
+WIFI_KEY = "Passw0rd!"
+INFLUX_HOST = "10.0.0.1:8086"
+INFLUX_DB = "fitness"
