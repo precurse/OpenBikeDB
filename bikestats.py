@@ -8,14 +8,8 @@ import ntptime
 import aioble
 import ssd1306
 import uasyncio as asyncio
-import urequests
 from machine import Pin, SoftI2C
 from micropython import const
-
-"""
-TODO:
-- Fix BLE disconnecting during session to autoresume
-"""
 
 class SessionDone(Exception):
     pass
@@ -24,7 +18,6 @@ class BikeStats():
     def __init__(self):
         self._connected = False
 
-        # Metric format
         self.reset_stats()
 
         self.session_started = False
@@ -32,10 +25,8 @@ class BikeStats():
         self.session_paused = False
         self.session_paused_time = None
 
-        self.influx_last_send = 0
-
     def reset_stats(self):
-        # Reset stats
+        # Used to both initialize and reset data
         self.data = {
             'id':0,
             'power_max':0,
@@ -91,10 +82,8 @@ class BikeStats():
     def update_hr(self, val):
         self.update_data('hr', val)
 
-    def update_dist(self, val):
-        self.data['dist_tot'] = val
-
     def update_duration(self):
+        # Ignore paused time
         self.data['duration'] = time.time() - self.session_start_time - self.data['paused_t']
 
     def update_calories(self, val):
@@ -102,13 +91,14 @@ class BikeStats():
 
     def update_distance(self):
         # Get average speed and duration
-        avg_speed = self.data['speed_avg']
-        duration = self.data['duration'] - self.data['paused_t']
+        speed_avg = self.data['speed_avg']
+        duration = self.data['duration']
 
         # Speed km/h * seconds / (60*60)
-        self.data['dist_tot'] = avg_speed * duration / (60*60)
+        self.data['dist_tot'] = speed_avg * duration / (60*60)
 
     def update_paused_time(self):
+        # Tracks the total time a session has been paused
         paused_time_elapsed = time.time() - self.session_paused_time
         self.data['paused_t'] += paused_time_elapsed
 
@@ -132,15 +122,14 @@ class BikeStats():
         self.session_paused = False
         self.update_paused_time()
         self.session_paused_time = None
-        print(f"Resumed after {paused_time_elapsed} seconds")
 
     def pause_session(self):
         self.session_paused = True
         self.session_paused_time = time.time()
 
     def get_calories(self):
+        # Returns kcal based on average power and duration
         # energy (kcal) = avg power (Watts) X duration (hours) X 3.6
-        # 205 Watts * 1.5 hours * 3.6 = 1,107 kcal
         time_elapsed = self.data['duration'] - self.data['paused_t']
         kcal = self.data['power_avg'] * time_elapsed/3600 * 3.6
         return kcal
@@ -190,6 +179,7 @@ class BikeStats():
                     # If session is paused for 3 minutes, end it
                     if time.time() - self.session_paused_time >= 60*3:
                         self.end_session()
+                    return
                 elif self.session_started and not self.session_paused:
                     self.session_paused = False
                     # Session is going!

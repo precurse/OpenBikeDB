@@ -7,6 +7,7 @@ import sys
 import time
 import ntptime
 import aioble
+import urequests as requests
 import uasyncio as asyncio
 import ssd1306
 from micropython import const
@@ -154,7 +155,7 @@ async def influx_task(bs):
             data += f' {ts}'
 
             try:
-                urequests.post(f'http://{INFLUX_HOST}/api/v2/write?bucket={INFLUX_DB}&precision=s', data=data)
+                requests.post(f'http://{INFLUX_HOST}/api/v2/write?bucket={INFLUX_DB}&precision=s', data=data)
             except OSError:
                 print("Failed to upload to influxdb")
 
@@ -219,10 +220,21 @@ async def bike_task(bs,oled):
                 await connect_bike(device, bs, oled)
         except aioble.DeviceDisconnectedError:
             pass
+        except AttributeError:
+            pass
         # Wait 5s between connection attempts
         await asyncio.sleep_ms(5000)
 
+def set_global_exception():
+    def handle_exception(loop, context):
+        import sys
+        sys.print_exception(context["exception"])
+        sys.exit()
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(handle_exception)
+
 async def main():
+    set_global_exception()  # Debug aid
     network_init()
     oled = oled_init()
     bs = BikeStats()
@@ -232,4 +244,7 @@ async def main():
     t3 = asyncio.create_task(influx_task(bs))
     await asyncio.gather(t1,t2,t3)
 
-asyncio.run(main())
+try:
+    asyncio.run(main())
+finally:
+    asyncio.new_event_loop()
