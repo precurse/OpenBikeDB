@@ -252,7 +252,3 @@ class BikeStats():
         output += "Total Cals {}".format(self.data['calories_tot'])
         output += "/ AVG Watts {}".format(self.data['power_avg'])
         output += "/ AVG Speed {}".format(self.data['speed_avg'])
-        # print(output)
-        # Print data to console every 10 seconds
-        if time.time() % 10 == 0:
-            print(f"Raw: {self.data}")

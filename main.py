@@ -2,7 +2,6 @@ import ubluetooth as bluetooth
 import binascii
 import network
 import struct
-import random
 import sys
 import time
 import ntptime
@@ -10,6 +9,7 @@ import aioble
 import urequests as requests
 import uasyncio as asyncio
 import ssd1306
+from collections import deque
 from micropython import const
 from machine import Pin, SoftI2C, RTC
 from bikestats import BikeStats, SessionDone
@@ -103,9 +103,8 @@ async def connect_bike(device, bike, oled):
             except SessionDone:
                 # Reset Bike Stats
                 bike.reset_stats()
+                await bike.disconnect()
                 return
-            #print(indoor_bike_data_char.read())
-            #await asyncio.sleep_ms(1000)
 
 def oled_print(oled, text):
     oled.fill(0)
@@ -119,51 +118,79 @@ def oled_init():
     oled = ssd1306.SSD1306_I2C(oled_width, oled_height, i2c)
     return oled
 
-async def influx_task(bs):
+async def data_queue_task(bs,q):
+    """
+    Used to put metrics onto a deque for InfluxDB consumer
+    """
     d = bs.data
     while True:
-        if d['id'] != 0:
-            i = d['id']
-            pmax = d['power_max']
-            pcur = d['power_last']
-            pavg = d['power_avg']
-            cadmax = d['cadence_max']
-            cadcur = d['cadence_last']
-            cadavg = d['cadence_avg']
-            smax = d['speed_max']
-            scur = d['speed_last']
-            savg = d['speed_avg']
-            hrmax = d['hr_max']
-            hrcur = d['hr_last']
-            hravg = d['hr_avg']
-            cals = d['calories_tot']
-            duration = d['duration']
-            dist = d['dist_tot']
+        if d['id'] != 0 and not bs.session_paused:
+            meas = {}
+            meas['id'] = d['id']
+            meas['pmax'] = d['power_max']
+            meas['pcur'] = d['power_last']
+            meas['pavg'] = d['power_avg']
+            meas['cadmax'] = d['cadence_max']
+            meas['cadcur'] = d['cadence_last']
+            meas['cadavg'] = d['cadence_avg']
+            meas['smax'] = d['speed_max']
+            meas['scur'] = d['speed_last']
+            meas['savg'] = d['speed_avg']
+            meas['hrmax'] = d['hr_max']
+            meas['hrcur'] = d['hr_last']
+            meas['hravg'] = d['hr_avg']
+            meas['cals'] = d['calories_tot']
+            meas['duration'] = d['duration']
+            meas['dist'] = d['dist_tot']
             # True UNIX timestamp
-            ts = time.time() + 946684800
+            meas['ts'] = time.time() + 946684800
+            q.append(meas)
+            # Run every 1 second
+            await asyncio.sleep_ms(1000)
+        else:
+            # Check every 500ms for data if not started
+            await asyncio.sleep_ms(500)
 
-            data = f'{INFLUX_DB},id={i} '
-            data += f'power_max={pmax},power_last={pcur},power_avg={pavg},' 
-            data += f'cadence_max={cadmax},cadence_last={cadcur},cadence_avg={cadavg},' 
-            data += f'speed_max={smax},speed_last={scur},speed_avg={savg},distance={dist},' 
-            data += f'calories={cals},duration={duration}' 
+async def influx_task(bs,q):
+    d = bs.data
+    # q.popleft()
+    while True:
+        # Wait until deque has 5 readings
+        if len(q) >= 5:
+            data = ""
+            # Grab 5 measurements to send
+            for i in range(5):
+                m = q.popleft()
+                data += f'{INFLUX_DB},id={m["id"]} '
+                data += f'power_max={m["pmax"]},power_last={m["pcur"]},power_avg={m["pavg"]},' 
+                data += f'cadence_max={m["cadmax"]},cadence_last={m["cadcur"]},cadence_avg={m["cadavg"]},' 
+                data += f'speed_max={m["smax"]},speed_last={m["scur"]},speed_avg={m["savg"]},distance={m["dist"]},' 
+                data += f'calories={m["cals"]},duration={m["duration"]}' 
 
-            # Check if HR present
-            if d['hr_cnt'] > 0:
-                data += f',hr_max={hrmax},hr_last={hrcur},hr_avg={hravg}' 
+                # Check if HR present
+                if m['hravg'] > 0:
+                    data += f',hr_max={m["hrmax"]},hr_last={m["hrcur"]},hr_avg={m["hravg"]}' 
 
-            data += f' {ts}'
+                data += f' {m["ts"]}'
+                # New line at end of each measurement, except the last one
+                if i < 4:
+                    data += '\n'
 
             try:
                 requests.post(f'http://{INFLUX_HOST}/api/v2/write?bucket={INFLUX_DB}&precision=s', data=data)
             except OSError:
                 print("Failed to upload to influxdb")
+                # Try again, so we don't lose metrics
+                await asyncio.sleep_ms(1)
+                try:
+                    requests.post(f'http://{INFLUX_HOST}/api/v2/write?bucket={INFLUX_DB}&precision=s', data=data)
+                except OSError:
+                    print("Failed to retry upload to influxdb")
+            finally:
+                del(data)
 
-            # Run every 10 seconds
-            await asyncio.sleep_ms(10000)
-        else:
-            # Recheck every 1/2 second for data
-            await asyncio.sleep_ms(500)
+        # Run every 1 second
+        await asyncio.sleep(1)
 
 async def oled_task(bs,oled):
     # Loop through bike data
@@ -172,6 +199,10 @@ async def oled_task(bs,oled):
         if data['id'] == 0:
             oled.fill(0)
             oled.text('Not started',0,0)
+            oled.show()
+        elif data['id'] != 0 and bs.session_paused:
+            oled.fill(0)
+            oled.text('Session paused',0,0)
             oled.show()
         else:
             cad = int(data['cadence_last'])
@@ -223,7 +254,7 @@ async def bike_task(bs,oled):
         except AttributeError:
             pass
         # Wait 5s between connection attempts
-        await asyncio.sleep_ms(5000)
+        await asyncio.sleep(5)
 
 def set_global_exception():
     def handle_exception(loop, context):
@@ -238,11 +269,13 @@ async def main():
     network_init()
     oled = oled_init()
     bs = BikeStats()
+    q = deque((),20)
 
     t1 = asyncio.create_task(bike_task(bs,oled))
     t2 = asyncio.create_task(oled_task(bs,oled))
-    t3 = asyncio.create_task(influx_task(bs))
-    await asyncio.gather(t1,t2,t3)
+    t3 = asyncio.create_task(data_queue_task(bs,q))
+    t4 = asyncio.create_task(influx_task(bs,q))
+    await asyncio.gather(t1,t2,t3,t4)
 
 try:
     asyncio.run(main())
