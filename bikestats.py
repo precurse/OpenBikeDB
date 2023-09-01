@@ -1,32 +1,30 @@
-import ubluetooth as bluetooth
-import binascii
-import network
-import random
-import sys
+import struct
 import time
-import ntptime
-import aioble
-import ssd1306
-import uasyncio as asyncio
-from machine import Pin, SoftI2C
-from micropython import const
+from ucollections import OrderedDict
 
 class SessionDone(Exception):
     pass
 
+# Workaround for lack of enum in MicroPython
+class SessionState(object):
+    NOT_STARTED = 1
+    RUNNING = 2
+    PAUSED = 3
+    ENDED = 4
+
 class BikeStats():
     def __init__(self):
         self._connected = False
-
+        self.session_state = SessionState.NOT_STARTED
         self.reset_stats()
-
         self.session_started = False
         self.session_start_time = None
-        self.session_paused = False
         self.session_paused_time = None
+        self.parse_struct_str = None
 
     def reset_stats(self):
         # Used to both initialize and reset data
+        self.session_state = SessionState.NOT_STARTED
         self.data = {
             'id':0,
             'power_max':0,
@@ -67,9 +65,6 @@ class BikeStats():
         self.data[name_last] = val
         self.data[name_cnt] += 1
 
-    def get_unix_time(self):
-        return time.time() + 946684800
-
     def update_power(self, val):
         self.update_data('power', val)
 
@@ -80,13 +75,16 @@ class BikeStats():
         self.update_data('cadence', val)
 
     def update_hr(self, val):
-        self.update_data('hr', val)
+        # 0 means not present or not working
+        if val > 0:
+            self.update_data('hr', val)
 
     def update_duration(self):
         # Ignore paused time
         self.data['duration'] = time.time() - self.session_start_time - self.data['paused_t']
 
-    def update_calories(self, val):
+    def update_calories(self):
+        val = self.get_calories()
         self.data['calories_tot'] = val
 
     def update_distance(self):
@@ -107,148 +105,144 @@ class BikeStats():
         self.session_start_time = time.time()
         # micropython uses EPOCH of 2000-01-01, so add that for the true EPOCH
         self.data['id'] = self.session_start_time + 946684800
-        #self._oled.fill(0)
+        self.session_state = SessionState.RUNNING
 
     def end_session(self):
         # Update paused time if session was paused, since there is 3m of inactivity before session ends
-        if self.session_paused:
+        if self.session_state == SessionState.PAUSED:
             self.update_paused_time()
             self.update_duration()
 
         # Send final data then end session
+        self.session_state = SessionState.ENDED
         raise SessionDone
 
     def resume_session(self):
-        self.session_paused = False
+        self.session_state = SessionState.RUNNING
         self.update_paused_time()
         self.session_paused_time = None
 
     def pause_session(self):
-        self.session_paused = True
+        self.session_state = SessionState.PAUSED
         self.session_paused_time = time.time()
 
     def get_calories(self):
         # Returns kcal based on average power and duration
         # energy (kcal) = avg power (Watts) X duration (hours) X 3.6
-        time_elapsed = self.data['duration'] - self.data['paused_t']
+        time_elapsed = self.data['duration']
         kcal = self.data['power_avg'] * time_elapsed/3600 * 3.6
         return kcal
 
+    async def parse_header(self, data):
+        """
+        BLE sends a long byte string containing all measurements, along with a "flag" header (uint16)
+        The flags (header) must first be checked to see what types of data is included
+        More here: (Test Suite pg 43) https://www.bluetooth.com/specifications/specs/fitness-machine-service-1-0/
+        GATT fields are always (or at least should always be) little-endian
+        Test data b'D\x02D\x0c\x8c\x00\x94\x00\x00'
+        """
+        # 4.9.1.1 Flags Field (page 43)
+        is_more_data = 0x0001
+        is_average_speed_present_mask = 0x0002
+        is_instantaneous_cadence_present_mask = 0x0004
+        is_average_cadence_present_mask = 0x0008
+        is_total_distance_present_mask = 0x0010
+        is_resistance_level_present = 0x0020
+        is_instantaneous_power_present = 0x0040
+        is_average_power_present = 0x0080
+        is_expended_energy_present = 0x0100
+        is_heart_rate_present = 0x0200
+        is_metabolic_equivalent_present = 0x0400
+        is_elapsed_time_present = 0x0800
+        is_remaining_time_present = 0x1000
+
+        flags = struct.unpack('<H', data[:2])[0]
+
+        # Unpacked data in order
+        self.udata = OrderedDict()
+
+        # Little endian
+        unpack_str = "<"
+        if not flags & is_more_data:
+            unpack_str += "H"
+            self.udata['speed'] = None
+        # if flags & is_average_speed_present_mask:
+        #     pass
+        if flags & is_instantaneous_cadence_present_mask:
+            unpack_str += "H"
+            self.udata['raw_cadence'] = None
+        # if flags & is_average_cadence_present_mask:
+        #     pass
+        # if flags & is_total_distance_present_mask:
+        #     pass
+        # if flags & is_resistance_level_present:
+        #     pass
+        if flags & is_instantaneous_power_present:
+            unpack_str += "H"
+            self.udata['power'] = None
+        # if flags & is_average_power_present:
+        #     pass
+        # if flags & is_expended_energy_present:
+        #     pass
+        if flags & is_heart_rate_present:
+            unpack_str += "B"
+            self.udata['hr'] = None
+        # if flags & is_metabolic_equivalent_present:
+        #     pass
+        # if flags & is_elapsed_time_present:
+        #     pass
+        # if flags & is_remaining_time_present:
+        #     pass
+
+        self.parse_struct_str = unpack_str
+
     async def parse_bike_data(self, data):
-            flags = int.from_bytes(data, 'little')
-            power = None
-            speed = None
-            output = ""
+        if not self.parse_struct_str:
+            await self.parse_header(data)
 
-            # is_more_data is actually current speed in km/h
-            is_more_data = 0x0001
-            is_instantaneous_cadence_present_mask = 0x0002
-            is_average_speed_present_mask = 0x0004
-            is_average_cadence_present_mask = 0x0008
-            is_total_distance_present_mask = 0x0010
-            is_resistance_level_present = 0x0020
-            is_instantaneous_power_present = 0x0040
-            is_average_power_present = 0x0080
-            is_expended_energy_present = 0x0100
-            is_heart_rate_present = 0x0200
-            is_metabolic_equivalent_present = 0x0400
-            is_elapsed_time_present = 0x0800
-            is_remaining_time_present = 0x1000
+        # Ignoring first 2 bytes (flags header)
+        raw_data = data[2:]
+        try:
+            parsed_data  = struct.unpack(self.parse_struct_str, raw_data)
+        except struct.error as e:
+            print(f"Failed to unpack data as expected: {e}")
+            return
 
-            # Header is 2 bytes (uint16)
-            measurement_byte_offset = 2
+        # Capture parsed data in order
+        for idx,d in enumerate(parsed_data):
+            k = list(self.udata)[idx]
+            self.udata[k] = d
 
-            # Instantaneous Speed
-            ## This is inversed i guess.. to work
-            if not flags & is_more_data:
-                speed = int.from_bytes(data[measurement_byte_offset:measurement_byte_offset+2], 'little')
-                measurement_byte_offset += 2
+        # Begin Session handling
+        if self.udata['speed'] > 0 and self.session_state == SessionState.NOT_STARTED:
+            self.start_session()
+        elif self.udata['speed'] > 0 and self.session_state == SessionState.PAUSED:
+            # Continuing a paused session
+            self.resume_session()
+        elif self.udata['speed'] == 0 and self.session_state == SessionState.RUNNING:
+            self.pause_session()
+            return
+        elif self.udata['speed'] == 0 and self.session_state == SessionState.PAUSED:
+            # If session is paused for 3 minutes, end it
+            if time.time() - self.session_paused_time >= 3*60:
+                self.end_session()
+            return
+        elif self.session_state == SessionState.NOT_STARTED:
+            return
 
-                # Threshold to consider training paused
-                speed_threshold = 0 
+        # Update metrics if they exist, otherwise ignore
+        for func, val in (
+            (self.update_speed, self.udata['speed']),
+            (self.update_cadence, self.udata['raw_cadence']/2),
+            (self.update_power, self.udata['power']),
+            (self.update_hr, self.udata['hr'])
+        ):
+            try:
+                func(val)
+            except KeyError:
+                break
 
-                if speed != speed_threshold and not self.session_started:
-                    self.start_session()
-                elif speed != speed_threshold and self.session_paused:
-                    # Continuing a paused session
-                    self.resume_session()
-                elif speed == speed_threshold and self.session_started and not self.session_paused:
-                    self.pause_session()
-                elif speed == speed_threshold and self.session_started and self.session_paused:
-                    print("Session paused...", end='\r')
-                    # If session is paused for 3 minutes, end it
-                    if time.time() - self.session_paused_time >= 60*3:
-                        self.end_session()
-                    return
-                elif self.session_started and not self.session_paused:
-                    self.session_paused = False
-                    # Session is going!
-                    #print("C1: Instantaneous Speed: {}".format(speed))
-                    self.update_speed(speed)
-                    output += "Speed {}".format(speed)
-                else:
-                    print("Session not started yet", end='\r')
-                    return
-
-            if flags & is_instantaneous_cadence_present_mask:
-                print("is_instantaneous_cadence_present_mask")
-
-            # This is actually Instantaneous Cadence
-            if flags & is_average_speed_present_mask:
-                cadence = int.from_bytes(data[measurement_byte_offset:measurement_byte_offset + 2], 'little')
-                measurement_byte_offset += 2
-
-                if self.session_started and not self.session_paused:
-                    rpm = cadence/2
-                    output += "/ RPM {}".format(rpm)
-                    self.update_cadence(rpm)
-
-            if flags & is_average_cadence_present_mask:
-                print("is_average_cadence_present_mask")
-            if flags & is_total_distance_present_mask:
-                print("is_total_distance_present_mask")
-            if flags & is_resistance_level_present:
-                print("is_resistance_level_present")
-            if flags & is_instantaneous_power_present:
-                power = int.from_bytes(data[measurement_byte_offset:measurement_byte_offset + 2], 'little')
-                measurement_byte_offset += 2
-                self.update_power(power)
-                self.update_duration()
-                self.update_distance()
-                self.update_calories(self.get_calories())
-
-                if self.session_started and not self.session_paused:
-                    output += "/ watts {}".format(power)
-
-            if flags & is_average_power_present:
-                print("is_average_power_present")
-            if flags & is_expended_energy_present:
-                print("is_expended_energy_present")
-            if flags & is_heart_rate_present:
-                hr = int.from_bytes(data[measurement_byte_offset:measurement_byte_offset + 1], 'little')
-                measurement_byte_offset += 1
-
-                if self.session_started and not self.session_paused:
-                    if hr <= 0:
-                        hr = "n/a"
-                    else:
-                        self.update_hr(hr)
-                    output += "/ HR {}".format(hr)
-
-            if flags & is_metabolic_equivalent_present:
-                print("is_metabolic_equivalent_present")
-            if flags & is_elapsed_time_present:
-                print("is_elapsed_time_present")
-            if flags & is_remaining_time_present:
-                print("is_remaining_time_present")
-
-            # Only print session data if started
-            if self.session_started and not self.session_paused:
-                self.print_serial_data()
-                print(output, end="\r")
-
-    def print_serial_data(self):
-        output = "SESSION: "
-        output += "Total Cals {}".format(self.data['calories_tot'])
-        output += "/ AVG Watts {}".format(self.data['power_avg'])
-        output += "/ AVG Speed {}".format(self.data['speed_avg'])
+        # Run metrics calculations
+        self.update_duration()
+        self.update_distance()
+        self.update_calories()
