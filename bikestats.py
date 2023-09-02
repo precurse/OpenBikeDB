@@ -1,5 +1,6 @@
 import struct
 import time
+from uasyncio import Lock
 from ucollections import OrderedDict
 
 class SessionDone(Exception):
@@ -14,17 +15,24 @@ class SessionState(object):
 
 class BikeStats():
     def __init__(self):
-        self._connected = False
-        self.session_state = SessionState.NOT_STARTED
         self.reset_stats()
-        self.session_started = False
-        self.session_start_time = None
-        self.session_paused_time = None
-        self.parse_struct_str = None
+        self.lock = Lock()  # Used when updating data
 
     def reset_stats(self):
-        # Used to both initialize and reset data
+        """
+        Used to both initialize and reset data
+        """
         self.session_state = SessionState.NOT_STARTED
+
+        # Track times
+        self.session_start_time = None
+        self.session_paused_time = None
+
+        # Track supported metrics by fitness machine
+        self.metrics = OrderedDict()
+        # Track string used to parse data
+        self.parse_struct_str = None
+
         self.data = {
             'id':0,
             'power_max':0,
@@ -101,7 +109,6 @@ class BikeStats():
         self.data['paused_t'] += paused_time_elapsed
 
     def start_session(self):
-        self.session_started = True
         self.session_start_time = time.time()
         # micropython uses EPOCH of 2000-01-01, so add that for the true EPOCH
         self.data['id'] = self.session_start_time + 946684800
@@ -158,19 +165,16 @@ class BikeStats():
 
         flags = struct.unpack('<H', data[:2])[0]
 
-        # Unpacked data in order
-        self.udata = OrderedDict()
-
         # Little endian
         unpack_str = "<"
         if not flags & is_more_data:
             unpack_str += "H"
-            self.udata['speed'] = None
+            self.metrics['speed'] = None
         # if flags & is_average_speed_present_mask:
         #     pass
         if flags & is_instantaneous_cadence_present_mask:
             unpack_str += "H"
-            self.udata['raw_cadence'] = None
+            self.metrics['raw_cadence'] = None
         # if flags & is_average_cadence_present_mask:
         #     pass
         # if flags & is_total_distance_present_mask:
@@ -179,24 +183,26 @@ class BikeStats():
         #     pass
         if flags & is_instantaneous_power_present:
             unpack_str += "H"
-            self.udata['power'] = None
+            self.metrics['power'] = None
         # if flags & is_average_power_present:
         #     pass
         # if flags & is_expended_energy_present:
         #     pass
         if flags & is_heart_rate_present:
             unpack_str += "B"
-            self.udata['hr'] = None
+            self.metrics['hr'] = None
         # if flags & is_metabolic_equivalent_present:
         #     pass
         # if flags & is_elapsed_time_present:
         #     pass
         # if flags & is_remaining_time_present:
         #     pass
+        print("Device supports: {}".format(", ".join(self.metrics.keys())))
 
         self.parse_struct_str = unpack_str
 
     async def parse_bike_data(self, data):
+        # Parse header for supported metrics
         if not self.parse_struct_str:
             await self.parse_header(data)
 
@@ -210,19 +216,19 @@ class BikeStats():
 
         # Capture parsed data in order
         for idx,d in enumerate(parsed_data):
-            k = list(self.udata)[idx]
-            self.udata[k] = d
+            k = list(self.metrics)[idx]
+            self.metrics[k] = d
 
         # Begin Session handling
-        if self.udata['speed'] > 0 and self.session_state == SessionState.NOT_STARTED:
+        if self.metrics['speed'] > 0 and self.session_state == SessionState.NOT_STARTED:
             self.start_session()
-        elif self.udata['speed'] > 0 and self.session_state == SessionState.PAUSED:
+        elif self.metrics['speed'] > 0 and self.session_state == SessionState.PAUSED:
             # Continuing a paused session
             self.resume_session()
-        elif self.udata['speed'] == 0 and self.session_state == SessionState.RUNNING:
+        elif self.metrics['speed'] == 0 and self.session_state == SessionState.RUNNING:
             self.pause_session()
             return
-        elif self.udata['speed'] == 0 and self.session_state == SessionState.PAUSED:
+        elif self.metrics['speed'] == 0 and self.session_state == SessionState.PAUSED:
             # If session is paused for 3 minutes, end it
             if time.time() - self.session_paused_time >= 3*60:
                 self.end_session()
@@ -230,19 +236,20 @@ class BikeStats():
         elif self.session_state == SessionState.NOT_STARTED:
             return
 
-        # Update metrics if they exist, otherwise ignore
-        for func, val in (
-            (self.update_speed, self.udata['speed']),
-            (self.update_cadence, self.udata['raw_cadence']/2),
-            (self.update_power, self.udata['power']),
-            (self.update_hr, self.udata['hr'])
-        ):
-            try:
-                func(val)
-            except KeyError:
-                break
+        async with self.lock:
+            # Update metrics if they exist, otherwise ignore
+            for func, val in (
+                (self.update_speed, self.metrics['speed']),
+                (self.update_cadence, self.metrics['raw_cadence']/2),
+                (self.update_power, self.metrics['power']),
+                (self.update_hr, self.metrics['hr'])
+            ):
+                try:
+                    func(val)
+                except KeyError:
+                    break
 
-        # Run metrics calculations
-        self.update_duration()
-        self.update_distance()
-        self.update_calories()
+            # Run metrics calculations
+            self.update_duration()
+            self.update_distance()
+            self.update_calories()

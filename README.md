@@ -27,4 +27,4 @@ device pairing just before I want to workout.
 - ESP32 board
 - SSD1306 display
 - Bluetooth Low-Energy enabled spin bike (like the Schwinn IC4)
-- Ensure your Schwinn IC4 is properly calibrated as per [page 18](https://download.nautilus.com/supportdocs/AM_OM/Bowflex/BFX.C6.SCH.IC4.IC8.SM.pdf) of the service manual
+- A calibrated Schwinn IC4 as per [page 18](https://download.nautilus.com/supportdocs/AM_OM/Bowflex/BFX.C6.SCH.IC4.IC8.SM.pdf) of the service manual

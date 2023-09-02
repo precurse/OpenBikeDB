@@ -143,23 +143,23 @@ async def data_queue_task(bs,q):
         if d['id'] != 0 and bs.session_state == SessionState.RUNNING:
             meas = {}
             meas['ts'] = time.time() + 946684800 # True UNIX timestamp
-
-            meas['id'] = d['id']
-            meas['pmax'] = d['power_max']
-            meas['pcur'] = d['power_last']
-            meas['pavg'] = d['power_avg']
-            meas['cadmax'] = d['cadence_max']
-            meas['cadcur'] = d['cadence_last']
-            meas['cadavg'] = d['cadence_avg']
-            meas['smax'] = d['speed_max']
-            meas['scur'] = d['speed_last']
-            meas['savg'] = d['speed_avg']
-            meas['hrmax'] = d['hr_max']
-            meas['hrcur'] = d['hr_last']
-            meas['hravg'] = d['hr_avg']
-            meas['cals'] = d['calories_tot']
-            meas['duration'] = d['duration']
-            meas['dist'] = d['dist_tot']
+            async with bs.lock:
+                meas['id'] = d['id']
+                meas['pmax'] = d['power_max']
+                meas['pcur'] = d['power_last']
+                meas['pavg'] = d['power_avg']
+                meas['cadmax'] = d['cadence_max']
+                meas['cadcur'] = d['cadence_last']
+                meas['cadavg'] = d['cadence_avg']
+                meas['smax'] = d['speed_max']
+                meas['scur'] = d['speed_last']
+                meas['savg'] = d['speed_avg']
+                meas['hrmax'] = d['hr_max']
+                meas['hrcur'] = d['hr_last']
+                meas['hravg'] = d['hr_avg']
+                meas['cals'] = d['calories_tot']
+                meas['duration'] = d['duration']
+                meas['dist'] = d['dist_tot']
             q.append(meas)
 
             await asyncio.sleep(DATA_INTERVAL)
